@@ -1,0 +1,342 @@
+name: CI/CD Pipeline - Super Admin (main)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '22'
+  DEPLOY_PATH: 'C:\inetpub\apps\trading-agent\superadmin'
+  # IIS serves the built files and proxies /api/* to the backend Dashboard
+  # (127.0.0.1:BACKEND_PORT on the same server), so the browser stays same-origin
+  IIS_SITE_NAME: 'trading-agent-superadmin'
+  IIS_PORT: '7772'
+  BACKEND_PORT: '7773'
+  # Public WinRM ports (the router forwards these to the server's listeners)
+  WINRM_HTTPS_PORT: '55986'
+  WINRM_HTTP_PORT: '53389'
+
+concurrency:
+  group: ci-cd-superadmin-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # JOB 1: BUILD
+  # Installs dependencies, builds with Vite and packages dist/ for deployment.
+  # VITE_API_BASE_URL is left empty on purpose: calls go to /api on the same
+  # origin and IIS forwards them to the backend.
+  # ============================================================================
+  build:
+    name: Build Super Admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          VITE_API_BASE_URL: ''
+        run: |
+          npm run build
+          test -f dist/index.html
+          echo "✅ Build completed"
+
+      - name: Create Deployment Package
+        run: |
+          cd dist && zip -r -q ../deployment-superadmin.zip . && cd ..
+          unzip -l deployment-superadmin.zip | tail -1
+          echo "✅ Deployment package created"
+
+      - name: Upload Deployment Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package-superadmin
+          path: deployment-superadmin.zip
+          retention-days: 14
+
+      - name: Generate Build Report
+        run: |
+          PKG_SIZE=$(du -k deployment-superadmin.zip | cut -f1)
+          FILE_COUNT=$(unzip -Z1 deployment-superadmin.zip | grep -v '/$' | wc -l)
+          echo "## Build Summary (Super Admin)"                   >> $GITHUB_STEP_SUMMARY
+          echo ""                                              >> $GITHUB_STEP_SUMMARY
+          echo "✅ Node Version : ${{ env.NODE_VERSION }}"      >> $GITHUB_STEP_SUMMARY
+          echo "✅ Package Size : ${PKG_SIZE} KB"               >> $GITHUB_STEP_SUMMARY
+          echo "✅ File Count   : ${FILE_COUNT} files"          >> $GITHUB_STEP_SUMMARY
+          echo "📦 Artifact     : deployment-package-superadmin"  >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # JOB 2: DEPLOY TO PRODUCTION
+  # Connects via WinRM, backs up the current site, replaces the static files,
+  # writes web.config (SPA fallback + /api proxy) and creates/updates the IIS
+  # site, then checks the page and the proxied API through IIS.
+  # Only runs on push to main or manual trigger (not on PRs).
+  # ============================================================================
+  deploy:
+    name: Deploy Super Admin to Production
+    runs-on: windows-latest
+    needs: [build]
+    timeout-minutes: 20
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+    env:
+      DEPLOY_SERVER: ${{ secrets.PROD_SERVER }}
+      DEPLOY_USERNAME: ${{ secrets.PROD_USERNAME }}
+      DEPLOY_PASSWORD: ${{ secrets.PROD_PASSWORD }}
+
+    steps:
+      - name: Download Deployment Package
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package-superadmin
+          path: .
+
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:DEPLOY_SERVER))   { $missing += "PROD_SERVER" }
+          if ([string]::IsNullOrWhiteSpace($env:DEPLOY_USERNAME)) { $missing += "PROD_USERNAME" }
+          if ([string]::IsNullOrWhiteSpace($env:DEPLOY_PASSWORD)) { $missing += "PROD_PASSWORD" }
+          if ($missing.Count -gt 0) {
+            echo "## ❌ Missing Required Secrets" >> $env:GITHUB_STEP_SUMMARY
+            foreach ($s in $missing) { echo "- **$s**" >> $env:GITHUB_STEP_SUMMARY }
+            echo "Add them in: Settings → Environments → production → Secrets" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error "❌ Missing required secrets: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "✅ All required secrets are configured"
+
+      - name: Deploy to Production Server
+        shell: pwsh
+        run: |
+          # Read settings as $env:NAME here, never as a GitHub expression (see backend workflow).
+          $ErrorActionPreference = "Stop"
+
+          $password   = ConvertTo-SecureString $env:DEPLOY_PASSWORD.Trim() -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($env:DEPLOY_USERNAME.Trim(), $password)
+          $server     = ($env:DEPLOY_SERVER.Trim() -replace '^[a-zA-Z]+://', '' -replace '[/:].*$', '')
+
+          $httpsPort = [int]$env:WINRM_HTTPS_PORT
+          $httpPort  = [int]$env:WINRM_HTTP_PORT
+          $reachable = @{}
+          foreach ($p in $httpsPort, $httpPort) {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            try { $reachable[$p] = $tcp.ConnectAsync($server, $p).Wait(8000) -and $tcp.Connected }
+            catch { $reachable[$p] = $false } finally { $tcp.Close() }
+            Write-Host "Port ${p}: $(if ($reachable[$p]) { '✅ open' } else { '❌ not reachable' })"
+          }
+          if ($server -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.)') {
+            Write-Host "❌ PROD_SERVER is a private/LAN IP: GitHub runners cannot reach it. Use the public IP."
+          }
+
+          try {
+            Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force -ErrorAction Stop
+          } catch { Write-Host "⚠️ Could not configure TrustedHosts: $($_.Exception.Message)" }
+
+          $sessionOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+          Write-Host "Connecting to the server..."
+          $session = $null
+          try {
+            $session = New-PSSession -ComputerName $server -Credential $credential `
+                         -UseSSL -Port $httpsPort -SessionOption $sessionOptions -ErrorAction Stop
+            Write-Host "✅ Connected via HTTPS"
+          } catch {
+            Write-Host "⚠️ HTTPS failed. Attempting HTTP (port $httpPort)..."
+            try {
+              $session = New-PSSession -ComputerName $server -Credential $credential -Port $httpPort -ErrorAction Stop
+              Write-Host "✅ Connected via HTTP"
+            } catch {
+              Write-Error "❌ Failed to connect: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+
+          Write-Host "Creating backup before deployment..."
+          $backupPath = Invoke-Command -Session $session -ScriptBlock {
+            param($deployPath)
+            if (-not (Test-Path (Join-Path $deployPath "index.html"))) {
+              Write-Host "No existing deployment — skipping backup (first deploy)"
+              return $null
+            }
+            # Backups live next to the site, never inside the web root
+            $backupsDir = Join-Path (Split-Path $deployPath -Parent) "superadmin-backups"
+            $backupPath = Join-Path $backupsDir ("backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+            New-Item -Path $backupPath -ItemType Directory -Force | Out-Null
+            Copy-Item -Path (Join-Path $deployPath "*") -Destination $backupPath -Recurse -Force
+            Write-Host "✅ Backup created at: $backupPath"
+            $backups = Get-ChildItem -Path $backupsDir -Directory | Where-Object { $_.Name -like "backup_*" } |
+                       Sort-Object LastWriteTime -Descending
+            if ($backups.Count -gt 3) {
+              $backups | Select-Object -Skip 3 | ForEach-Object { Remove-Item -Path $_.FullName -Recurse -Force }
+              Write-Host "✅ Old backups cleaned (kept last 3)"
+            }
+            return $backupPath
+          } -ArgumentList $env:DEPLOY_PATH
+
+          Write-Host "Replacing site files..."
+          Invoke-Command -Session $session -ScriptBlock {
+            param($deployPath)
+            if (-not (Test-Path $deployPath)) { New-Item -Path $deployPath -ItemType Directory -Force | Out-Null }
+            else { Get-ChildItem -Path $deployPath -Force | Remove-Item -Force -Recurse }
+          } -ArgumentList $env:DEPLOY_PATH
+          $remoteZip = Invoke-Command -Session $session -ScriptBlock { Join-Path $env:TEMP "deployment-superadmin.zip" }
+          Copy-Item -Path "./deployment-superadmin.zip" -Destination $remoteZip -ToSession $session -Force
+          Invoke-Command -Session $session -ScriptBlock {
+            param($zip, $deployPath)
+            Expand-Archive -Path $zip -DestinationPath $deployPath -Force
+            Remove-Item $zip -Force
+            Write-Host "✅ Files deployed"
+          } -ArgumentList $remoteZip, $env:DEPLOY_PATH
+
+          Write-Host "Configuring IIS..."
+          $iisOk = Invoke-Command -Session $session -ScriptBlock {
+            param($siteName, $iisPort, $sitePath, $backendPort)
+            Import-Module WebAdministration -ErrorAction Stop
+            $apphost = 'MACHINE/WEBROOT/APPHOST'
+
+            # Prerequisites: URL Rewrite + Application Request Routing (ARR)
+            $modules = @(Get-WebGlobalModule | ForEach-Object { $_.Name })
+            $missing = @()
+            if ($modules -notcontains 'RewriteModule') { $missing += 'URL Rewrite (https://www.iis.net/downloads/microsoft/url-rewrite)' }
+            if ($modules -notcontains 'ApplicationRequestRouting') { $missing += 'Application Request Routing 3.0 (https://www.iis.net/downloads/microsoft/application-request-routing)' }
+            if ($missing.Count -gt 0) { throw "Install on the server, then re-run: $($missing -join '; ')" }
+
+            $taken = Get-WebBinding -Port $iisPort | Where-Object { $_.ItemXPath -notmatch "@name='$siteName'" }
+            if ($taken) { throw "Port $iisPort is already bound by another IIS site: $($taken.ItemXPath)" }
+
+            Set-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/proxy' -Name enabled -Value $true
+            Set-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/proxy' -Name timeout -Value '00:05:00'
+            Set-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/proxy' -Name xForwardedForHeaderName -Value 'X-Forwarded-For'
+
+            if (-not (Test-Path "IIS:\AppPools\$siteName")) {
+              New-WebAppPool -Name $siteName | Out-Null
+              Write-Host "✅ App pool '$siteName' created"
+            }
+            Set-ItemProperty "IIS:\AppPools\$siteName" -Name managedRuntimeVersion -Value ''
+            if (-not (Test-Path "IIS:\Sites\$siteName")) {
+              New-Website -Name $siteName -Port $iisPort -PhysicalPath $sitePath -ApplicationPool $siteName | Out-Null
+              Write-Host "✅ IIS site '$siteName' created on port $iisPort"
+            } else {
+              Set-ItemProperty "IIS:\Sites\$siteName" -Name physicalPath -Value $sitePath
+              Set-ItemProperty "IIS:\Sites\$siteName" -Name applicationPool -Value $siteName
+              Set-ItemProperty "IIS:\Sites\$siteName" -Name bindings -Value @{ protocol = 'http'; bindingInformation = "*:${iisPort}:" }
+            }
+
+            # /api -> backend Dashboard; any other path that is not a file -> index.html (SPA).
+            # Hashed assets are immutable; index.html must always be revalidated.
+            $lines = @(
+              '<?xml version="1.0" encoding="utf-8"?>',
+              '<!-- Managed by the CI/CD pipeline. Edits are overwritten on deploy. -->',
+              '<configuration>',
+              '  <system.webServer>',
+              '    <rewrite>',
+              '      <rules>',
+              '        <rule name="API proxy" stopProcessing="true">',
+              '          <match url="^api/(.*)" />',
+              "          <action type=""Rewrite"" url=""http://127.0.0.1:$backendPort/api/{R:1}"" />",
+              '        </rule>',
+              '        <rule name="SPA fallback" stopProcessing="true">',
+              '          <match url=".*" />',
+              '          <conditions logicalGrouping="MatchAll">',
+              '            <add input="{REQUEST_FILENAME}" matchType="IsFile" negate="true" />',
+              '            <add input="{REQUEST_FILENAME}" matchType="IsDirectory" negate="true" />',
+              '          </conditions>',
+              '          <action type="Rewrite" url="/index.html" />',
+              '        </rule>',
+              '      </rules>',
+              '    </rewrite>',
+              '    <httpErrors existingResponse="PassThrough" />',
+              '    <staticContent>',
+              '      <clientCache cacheControlMode="UseMaxAge" cacheControlMaxAge="365.00:00:00" />',
+              '    </staticContent>',
+              '  </system.webServer>',
+              '  <location path="index.html">',
+              '    <system.webServer>',
+              '      <staticContent>',
+              '        <clientCache cacheControlMode="DisableCache" />',
+              '      </staticContent>',
+              '    </system.webServer>',
+              '  </location>',
+              '</configuration>'
+            )
+            [System.IO.File]::WriteAllText((Join-Path $sitePath 'web.config'), ($lines -join "`r`n"), [System.Text.UTF8Encoding]::new($false))
+            Write-Host "✅ web.config written (/api -> 127.0.0.1:$backendPort)"
+
+            $ruleName = "IIS-$siteName-$iisPort"
+            if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -Name $ruleName -DisplayName "IIS $siteName (TCP $iisPort)" -Direction Inbound -Protocol TCP -LocalPort $iisPort -Action Allow -Profile Any | Out-Null
+              Write-Host "✅ Firewall rule '$ruleName' created"
+            }
+            if ((Get-WebAppPoolState -Name $siteName).Value -ne 'Started') { Start-WebAppPool -Name $siteName }
+            if ((Get-WebsiteState -Name $siteName).Value -ne 'Started') { Start-Website -Name $siteName }
+
+            # The page itself, then the proxied backend (a 401/403 still proves the proxy works)
+            $pageOk = $false
+            for ($i = 1; $i -le 6 -and -not $pageOk; $i++) {
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$iisPort/" -UseBasicParsing -TimeoutSec 15
+                if ($r.StatusCode -eq 200 -and $r.Content -match '<div id="root"') { $pageOk = $true }
+              } catch { Write-Host "Page attempt ${i} of 6: $($_.Exception.Message)" }
+              if (-not $pageOk) { Start-Sleep -Seconds 5 }
+            }
+            if ($pageOk) { Write-Host "✅ Page served through IIS on port $iisPort" }
+
+            $apiOk = $false
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$iisPort/api/auth/me" -UseBasicParsing -TimeoutSec 15
+              $apiOk = $true
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              if ($code -in 401, 403) { $apiOk = $true }
+              else { Write-Host "API check: $($_.Exception.Message)" }
+            }
+            if ($apiOk) { Write-Host "✅ /api reaches the backend through IIS" }
+            return ($pageOk -and $apiOk)
+          } -ArgumentList $env:IIS_SITE_NAME, $env:IIS_PORT, $env:DEPLOY_PATH, $env:BACKEND_PORT
+
+          Remove-PSSession $session
+
+          if (-not $iisOk) {
+            echo "## ❌ Super Admin Check Failed" >> $env:GITHUB_STEP_SUMMARY
+            echo "The page or the /api proxy did not answer through IIS port $($env:IIS_PORT). Is the backend deployed and running?" >> $env:GITHUB_STEP_SUMMARY
+            if ($backupPath) { echo "Previous version backed up at: ``$backupPath``" >> $env:GITHUB_STEP_SUMMARY }
+            Write-Error "❌ Deployed, but the site or API proxy is not healthy"
+            exit 1
+          }
+          echo "## ✅ Super Admin Checks Passed" >> $env:GITHUB_STEP_SUMMARY
+          Write-Host "✅ Deployment completed successfully!"
+
+      - name: Create Deployment Summary
+        if: always()
+        shell: pwsh
+        run: |
+          echo "## 🚀 Deployment Summary - Super Admin (Production)"          >> $env:GITHUB_STEP_SUMMARY
+          echo ""                                                           >> $env:GITHUB_STEP_SUMMARY
+          echo "**Node Version:**     ${{ env.NODE_VERSION }}"             >> $env:GITHUB_STEP_SUMMARY
+          echo "**Deployment Path:**  ${{ env.DEPLOY_PATH }}"              >> $env:GITHUB_STEP_SUMMARY
+          echo "**IIS Site:**         ${{ env.IIS_SITE_NAME }} on port ${{ env.IIS_PORT }}" >> $env:GITHUB_STEP_SUMMARY
+          echo "**API proxy:**        /api -> 127.0.0.1:${{ env.BACKEND_PORT }}" >> $env:GITHUB_STEP_SUMMARY
+          echo "**Deployed By:**      ${{ github.actor }}"                 >> $env:GITHUB_STEP_SUMMARY
+          echo "**Commit:**           ${{ github.sha }}"                   >> $env:GITHUB_STEP_SUMMARY
